@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlgoTrain</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2322c55e'/%3E%3Cpath d='M9 22l5-12 4 8 3-5 3 9' stroke='%23052e16' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="#/">
+      <span class="logo"><svg viewBox="0 0 32 32"><path d="M7 22l5-12 4 8 3-5 4 9" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span>AlgoTrain</span>
+    </a>
+    <nav id="nav">
+      <a href="#/" data-route="today"><span class="ni">◉</span>Сегодня<span class="badge" id="due-badge"></span></a>
+      <a href="#/problems" data-route="problems"><span class="ni">☰</span>Задачи</a>
+      <a href="#/calendar" data-route="calendar"><span class="ni">▦</span>Календарь</a>
+      <a href="#/algorithms" data-route="algorithms"><span class="ni">◈</span>Алгоритмы</a>
+      <a href="#/add" data-route="add"><span class="ni">＋</span>Добавить задачу</a>
+      <a href="#/settings" data-route="settings"><span class="ni">⚙</span>Настройки</a>
+    </nav>
+    <div class="side-foot">
+      <div class="streak" id="streak"></div>
+      <button class="ghost small" id="theme-toggle" title="Переключить тему">◐ Тема</button>
+    </div>
+  </aside>
+  <main id="app"><div class="loading">Загрузка…</div></main>
+</div>
+<div id="toast"></div>
+<script src="md.js"></script>
+<script src="srs.js"></script>
+<script src="viz.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
