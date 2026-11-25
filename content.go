@@ -3,8 +3,9 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,19 +33,22 @@ type Problem struct {
 	Description string     `json:"description"` // markdown
 	Solutions   []Solution `json:"solutions"`
 	File        string     `json:"file"`
+	Starter     string     `json:"starter,omitempty"` // заготовка для редактора
+	HasTests    bool       `json:"hasTests"`
+	Custom      bool       `json:"custom,omitempty"` // добавлена через интерфейс (хранится в БД)
 }
 
 // Algorithm — статья об алгоритме/паттерне.
 type Algorithm struct {
-	ID      string   `json:"id"`
-	Title   string   `json:"title"`
-	Short   string   `json:"short"`
-	Group   string   `json:"group"`
-	Icon    string   `json:"icon"`
-	Order   int      `json:"order"`
-	Viz     []string `json:"viz"`
-	Body    string   `json:"body"` // markdown
-	File    string   `json:"file"`
+	ID    string   `json:"id"`
+	Title string   `json:"title"`
+	Short string   `json:"short"`
+	Group string   `json:"group"`
+	Icon  string   `json:"icon"`
+	Order int      `json:"order"`
+	Viz   []string `json:"viz"`
+	Body  string   `json:"body"` // markdown
+	File  string   `json:"file"`
 }
 
 type Content struct {
@@ -176,23 +180,77 @@ func splitSolutions(body string) (string, []Solution) {
 	return strings.TrimSpace(desc.String()), sols
 }
 
-func LoadContent(root string) *Content {
+// contentFS — папка content: с диска (локальная разработка, правки видны сразу)
+// или встроенная в бинарник (продакшен).
+type contentFS struct {
+	fsys fs.FS
+	disk bool
+	root string
+}
+
+func newContentFS(root string, disk bool) contentFS {
+	return contentFS{fsys: os.DirFS(root), disk: disk, root: root}
+}
+
+func (c contentFS) glob(patterns ...string) []string {
+	var out []string
+	for _, p := range patterns {
+		m, _ := fs.Glob(c.fsys, p)
+		out = append(out, m...)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (c contentFS) read(name string) ([]byte, error) { return fs.ReadFile(c.fsys, name) }
+
+// stamp — отпечаток файлов (имена+размеры+время), чтобы понять, что контент изменился.
+func (c contentFS) stamp() string {
+	var b strings.Builder
+	_ = fs.WalkDir(c.fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			fmt.Fprintf(&b, "%s:%d:%d;", p, info.Size(), info.ModTime().UnixNano())
+		}
+		return nil
+	})
+	return b.String()
+}
+
+// customDoc — задача, добавленная через интерфейс (хранится в БД).
+type customDoc struct {
+	ID    string
+	Doc   string // markdown с front matter, как в файлах content/problems
+	Judge string // markdown с блоками ```go starter / ```go tests (может быть пустым)
+}
+
+func LoadContent(fsys contentFS, custom ...customDoc) *Content {
 	c := &Content{Problems: []Problem{}, Algorithms: []Algorithm{}, Categories: []string{}}
 	catOrder := map[string]int{}
 
-	probFiles, _ := filepath.Glob(filepath.Join(root, "problems", "*", "*.md"))
-	more, _ := filepath.Glob(filepath.Join(root, "problems", "*.md"))
-	probFiles = append(probFiles, more...)
-	sort.Strings(probFiles)
-	seen := map[string]string{}
-	for _, f := range probFiles {
-		b, err := os.ReadFile(f)
+	type srcDoc struct {
+		rel    string
+		text   string
+		custom bool
+	}
+	var srcs []srcDoc
+	for _, f := range fsys.glob("problems/*/*.md", "problems/*.md") {
+		b, err := fsys.read(f)
 		if err != nil {
 			c.Errors = append(c.Errors, err.Error())
 			continue
 		}
-		rel, _ := filepath.Rel(root, f)
-		for _, d := range parseDocs(string(b)) {
+		srcs = append(srcs, srcDoc{f, string(b), false})
+	}
+	for _, cd := range custom {
+		srcs = append(srcs, srcDoc{"db:" + cd.ID, cd.Doc, true})
+	}
+	seen := map[string]string{}
+	for _, src := range srcs {
+		rel := src.rel
+		for _, d := range parseDocs(src.text) {
 			m := d.meta
 			id := m["id"]
 			if id == "" {
@@ -212,7 +270,8 @@ func LoadContent(root string) *Content {
 				URL:        m["url"],
 				Lists:      splitList(m["lists"]),
 				Algorithms: splitList(m["algorithms"]),
-				File:       filepath.ToSlash(rel),
+				File:       rel,
+				Custom:     src.custom,
 			}
 			p.LeetCode, _ = strconv.Atoi(m["leetcode"])
 			p.Order, _ = strconv.Atoi(m["order"])
@@ -240,20 +299,18 @@ func LoadContent(root string) *Content {
 	}
 	sort.Slice(c.Categories, func(i, j int) bool { return catOrder[c.Categories[i]] < catOrder[c.Categories[j]] })
 
-	algoFiles, _ := filepath.Glob(filepath.Join(root, "algorithms", "*.md"))
-	sort.Strings(algoFiles)
-	for _, f := range algoFiles {
-		b, err := os.ReadFile(f)
+	for _, f := range fsys.glob("algorithms/*.md") {
+		b, err := fsys.read(f)
 		if err != nil {
 			c.Errors = append(c.Errors, err.Error())
 			continue
 		}
-		rel, _ := filepath.Rel(root, f)
+		rel := f
 		for _, d := range parseDocs(string(b)) {
 			m := d.meta
 			a := Algorithm{
 				ID: m["id"], Title: m["title"], Short: m["short"], Group: m["group"],
-				Icon: m["icon"], Viz: splitList(m["viz"]), Body: d.body, File: filepath.ToSlash(rel),
+				Icon: m["icon"], Viz: splitList(m["viz"]), Body: d.body, File: path.Clean(rel),
 			}
 			a.Order, _ = strconv.Atoi(m["order"])
 			if a.ID == "" {

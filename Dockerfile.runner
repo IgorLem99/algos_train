@@ -1,0 +1,21 @@
+# Образ раннера: проверяет решения пользователей. Нужен Go toolchain, поэтому
+# база — официальный golang. Процесс раннера стартует от root внутри контейнера
+# (capabilities урезаны в docker-compose.yml), компилирует от uid 1001 и запускает
+# каждое решение от отдельного uid без прав (см. sandbox_linux.go).
+FROM golang:1.27-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/algotrain .
+
+FROM golang:1.27-bookworm
+# prlimit (util-linux) уже есть в образе; пользователь-сборщик
+RUN useradd --uid 1001 --no-create-home --shell /usr/sbin/nologin builder \
+    && mkdir -p /cache /jobs && chown builder:builder /cache
+COPY --from=build /out/algotrain /usr/local/bin/algotrain
+ENV MODE=runner ADDR=:8081 LOG_FORMAT=json \
+    GOCACHE=/cache/go-build RUNNER_WORKDIR=/jobs \
+    GOTOOLCHAIN=local GOFLAGS=-mod=mod GOPROXY=off CGO_ENABLED=0 GOTELEMETRY=off
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/algotrain"]

@@ -17,12 +17,14 @@
     <nav id="nav">
       <a href="#/" data-route="today"><span class="ni">◉</span>Сегодня<span class="badge" id="due-badge"></span></a>
       <a href="#/problems" data-route="problems"><span class="ni">☰</span>Задачи</a>
+      <a href="#/submissions" data-route="submissions"><span class="ni">⌨</span>Мои отправки</a>
       <a href="#/calendar" data-route="calendar"><span class="ni">▦</span>Календарь</a>
       <a href="#/algorithms" data-route="algorithms"><span class="ni">◈</span>Алгоритмы</a>
-      <a href="#/add" data-route="add"><span class="ni">＋</span>Добавить задачу</a>
+      <a href="#/add" data-route="add" id="nav-add" hidden><span class="ni">＋</span>Добавить задачу</a>
       <a href="#/settings" data-route="settings"><span class="ni">⚙</span>Настройки</a>
     </nav>
     <div class="side-foot">
+      <div class="user-box" id="user-box"></div>
       <div class="streak" id="streak"></div>
       <button class="ghost small" id="theme-toggle" title="Переключить тему">◐ Тема</button>
     </div>
@@ -33,6 +35,7 @@
 <script src="md.js"></script>
 <script src="srs.js"></script>
 <script src="viz.js"></script>
+<script src="editor.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

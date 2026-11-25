@@ -32,13 +32,16 @@ var stdImports = []struct{ path, re string }{
 	{"fmt", `\bfmt\.`},
 	{"unicode", `\bunicode\.`},
 	{"bytes", `\bbytes\.`},
+	{"reflect", `\breflect\.`},
+	{"errors", `\berrors\.(New|Is|As|Join|Unwrap)\b`},
+	{"unicode/utf8", `\butf8\.`},
 }
 
 const predeclListNode = "type ListNode struct {\n\tVal  int\n\tNext *ListNode\n}\n"
 const predeclTreeNode = "type TreeNode struct {\n\tVal   int\n\tLeft  *TreeNode\n\tRight *TreeNode\n}\n"
 
 func runCheck(root, prefix string) int {
-	c := LoadContent(filepath.Join(root, "content"))
+	c := LoadContent(newContentFS(filepath.Join(root, "content"), true))
 	for _, e := range c.Errors {
 		fmt.Println("CONTENT:", e)
 	}

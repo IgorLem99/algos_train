@@ -7,15 +7,26 @@
 
   let C = { problems: [], algorithms: [], categories: [] };
   let P = {};
+  let ME = null;        // текущий пользователь
+  let SUBS = {};        // problemId → {count, accepted, last}
   let byId = {}, algoById = {};
 
   // ---------- data ----------
+  class AuthError extends Error {}
+  async function api(path, opts = {}) {
+    const headers = { 'X-Requested-With': 'AlgoTrain', ...(opts.headers || {}) };
+    let body = opts.body;
+    if (body !== undefined && typeof body !== 'string') { body = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
+    const r = await fetch(path, { method: opts.method || 'GET', headers, body, keepalive: opts.keepalive, credentials: 'same-origin' });
+    let j = null;
+    try { j = await r.json(); } catch (_) { }
+    if (r.status === 401 && !opts.allow401) { if (ME) { ME = null; showAuth(); } throw new AuthError((j && j.error) || 'нужно войти'); }
+    if (!r.ok) throw new Error((j && j.error) || `${r.status} ${r.statusText}`);
+    return j;
+  }
   async function loadAll() {
-    const [c, p] = await Promise.all([
-      fetch('/api/content').then(r => r.json()),
-      fetch('/api/progress').then(r => r.json()),
-    ]);
-    C = c; P = p || {};
+    const [c, p, s] = await Promise.all([api('/api/content'), api('/api/progress'), api('/api/submissions/summary')]);
+    C = c; P = p || {}; SUBS = s || {};
     P.problems = P.problems || {};
     P.settings = P.settings || {};
     index();
@@ -24,17 +35,22 @@
     byId = Object.fromEntries(C.problems.map(p => [p.id, p]));
     algoById = Object.fromEntries(C.algorithms.map(a => [a.id, a]));
   }
-  let saveTimer;
-  function save() {
+  let saveTimer, savePending = false;
+  async function flushSave(keepalive) {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(async () => {
-      try {
-        const r = await fetch('/api/progress', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(P, null, 1) });
-        if (!r.ok) throw new Error(await r.text());
-      } catch (e) { toast('Ошибка сохранения: ' + e.message); }
-    }, 250);
+    if (!savePending || !ME) return;
+    savePending = false;
+    try { await api('/api/progress', { method: 'PUT', body: P, keepalive }); }
+    catch (e) { if (!(e instanceof AuthError)) { savePending = true; toast('Ошибка сохранения: ' + e.message); } }
+  }
+  function save() {
+    savePending = true;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => flushSave(false), 400);
     updateChrome();
   }
+  // не потерять последние изменения при закрытии вкладки
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSave(true); });
   function toast(msg) {
     const t = $('#toast');
     t.textContent = msg; t.classList.add('show');
@@ -77,6 +93,26 @@
       </div>`).join('') + '</div>';
   }
 
+  const STATUS_SUB = {
+    accepted: ['Принято', 'ok'], wrong_answer: ['Неверный ответ', 'bad'], compile_error: ['Ошибка компиляции', 'warn'],
+    runtime_error: ['Ошибка выполнения', 'bad'], time_limit: ['Превышено время', 'warn'], internal_error: ['Ошибка проверки', 'warn'],
+  };
+  const subPill = s => { const [t, c] = STATUS_SUB[s] || [s, 'warn']; return `<span class="sub-pill ${c}">${t}</span>`; };
+  const ago = ms => {
+    const d = (Date.now() - ms) / 1000;
+    if (d < 60) return 'только что';
+    if (d < 3600) return Math.floor(d / 60) + ' мин назад';
+    if (d < 86400) return Math.floor(d / 3600) + ' ч назад';
+    const dt = new Date(ms);
+    return SRS.human(SRS.fmt(dt)) + ' ' + dt.toTimeString().slice(0, 5);
+  };
+  const codeBadge = id => {
+    const s = SUBS[id];
+    if (!s) return '';
+    return s.accepted ? `<span class="code-badge ok" title="Есть принятое решение в тренажёре (${s.count} отправок)">✓ код</span>`
+      : `<span class="code-badge" title="Отправок: ${s.count}, принятых нет">${s.count} попыт.</span>`;
+  };
+
   function updateChrome() {
     const n = dueList().length;
     $('#due-badge').textContent = n ? n : '';
@@ -112,6 +148,7 @@
       else if (act === 'practice') doPractice(id);
       else if (act === 'reset') doReset(id);
       else if (act === 'toggle') { if (rec(id)) doReset(id); else doSolve(id); }
+      if (RESULTS[id]) RESULTS[id].srsDone = true;
       route();
       return;
     }
@@ -215,7 +252,7 @@
         <td>${diff(p.difficulty)}</td>
         <td>${s === 'overdue' ? `<span class="pill overdue">просрочено ${late} дн.</span>` : pill(s)}</td>
         <td style="text-align:right;white-space:nowrap">
-          ${p.url ? `<a class="btn small" href="${esc(p.url)}" target="_blank" rel="noopener">Открыть ↗</a>` : ''}
+          ${p.hasTests ? `<a class="btn small" href="#/solve/${p.id}">⌨ Решать</a>` : p.url ? `<a class="btn small" href="${esc(p.url)}" target="_blank" rel="noopener">Открыть ↗</a>` : ''}
           <button class="ok small" data-act="ok" data-id="${p.id}">✓ Вспомнил</button>
           <button class="fail small" data-act="fail" data-id="${p.id}">✗ Забыл</button>
         </td></tr>`;
@@ -286,18 +323,18 @@
         const r = rec(p.id), s = st(p.id);
         return `<tr>
             <td><button class="check ${r ? 'on' : ''}" data-act="toggle" data-id="${p.id}" title="${r ? 'Сбросить' : 'Отметить решённой сегодня'}">${r ? '✓' : ''}</button></td>
-            <td class="ttl"><a href="#/problem/${p.id}">${esc(p.title)}</a>${p.leetcode ? ` <span class="dim small">#${p.leetcode}</span>` : ''}</td>
+            <td class="ttl"><a href="#/problem/${p.id}">${esc(p.title)}</a>${p.leetcode ? ` <span class="dim small">#${p.leetcode}</span>` : ''} ${codeBadge(p.id)}</td>
             <td>${diff(p.difficulty)}</td>
             <td>${p.algorithms.map(a => `<a class="tag" href="#/algo/${a}">${esc(algoById[a] ? algoById[a].title : a)}</a>`).join(' ')}</td>
             <td>${pill(s)}</td>
             <td>${r ? dots(p.id) : ''}</td>
             <td class="small ${s === 'overdue' ? '' : 'muted'}" style="${s === 'overdue' ? 'color:var(--hard)' : ''}">${r && r.due ? SRS.rel(r.due) : ''}</td>
-            <td>${p.url ? `<a href="${esc(p.url)}" target="_blank" rel="noopener" title="Открыть условие">↗</a>` : ''}</td>
+            <td style="white-space:nowrap">${p.hasTests ? `<a href="#/solve/${p.id}" title="Решать в редакторе">⌨</a> ` : ''}${p.url ? `<a href="${esc(p.url)}" target="_blank" rel="noopener" title="Открыть условие">↗</a>` : ''}</td>
           </tr>`;
       }).join('')}</tbody></table></div></details>`;
     }).join('');
     app.innerHTML = `
-      <div class="row" style="margin-bottom:16px"><h1 style="margin:0">Задачи</h1><span class="muted">${solvedAll} из ${C.problems.length} решено</span><span class="spacer"></span><a class="btn" href="#/add">＋ Добавить задачу</a></div>
+      <div class="row" style="margin-bottom:16px"><h1 style="margin:0">Задачи</h1><span class="muted">${solvedAll} из ${C.problems.length} решено</span><span class="spacer"></span>${ME && ME.admin ? '<a class="btn" href="#/add">＋ Добавить задачу</a>' : ''}</div>
       <div class="filters">
         <input type="search" data-f="q" placeholder="Поиск по названию или номеру…" value="${esc(F.q)}">
         ${sel('list', [['all', 'Все списки'], ...lists.map(l => [l, listName(l)])])}
@@ -329,6 +366,7 @@
     else if (s === 'learning') actions = `<button data-act="practice" data-id="${id}">Отметить практику</button>`;
     else if (s === 'mastered') actions = `<button data-act="solve" data-id="${id}">↻ Начать цикл заново</button>`;
     if (r) actions += `<button class="ghost danger small" data-act="reset" data-id="${id}">Сбросить</button>`;
+    if (p.hasTests) actions = `<a class="btn primary" href="#/solve/${id}">⌨ Решать в редакторе</a>` + actions.replace('class="primary"', '');
 
     const hide = P.settings.hideSolutions !== false && !shownSolutions.has(id);
     const sols = p.solutions.length ? (hide ?
@@ -348,6 +386,7 @@
           <h1>${p.leetcode ? `<span class="dim">${p.leetcode}.</span> ` : ''}${esc(p.title)}</h1>
           <div class="meta">${diff(p.difficulty)} ${pill(s)} <span class="tag">${esc(p.category)}</span>
             ${p.lists.map(l => `<span class="tag">${esc(listName(l))}</span>`).join('')}
+            ${codeBadge(id)}
             ${p.url ? `<a href="${esc(p.url)}" target="_blank" rel="noopener">${p.url.includes('leetcode.com') ? 'Открыть на LeetCode' : 'Открыть условие'} ↗</a>` : ''}</div>
         </div>
         <div class="row">${actions}</div>
@@ -515,15 +554,15 @@
       </div>`;
     const art = $('#art');
     enhanceArticle(art);
-    $('#toc').innerHTML = $$('h2', art).map(h => `<a href="javascript:void 0" data-to="${h.id}">${esc(h.textContent)}</a>`).join('');
-    $$('[data-to]').forEach(l => l.onclick = () => document.getElementById(l.dataset.to).scrollIntoView({ behavior: 'smooth' }));
+    $('#toc').innerHTML = $$('h2', art).map(h => `<a href="#" data-to="${h.id}">${esc(h.textContent)}</a>`).join('');
+    $$('[data-to]').forEach(l => l.onclick = e => { e.preventDefault(); document.getElementById(l.dataset.to).scrollIntoView({ behavior: 'smooth' }); });
   }
 
   // ----- add problem -----
   function viewAdd() {
     const cats = C.categories;
     app.innerHTML = `<h1>Добавить задачу</h1>
-      <p class="muted" style="max-width:760px">Задача сохранится в <code>content/problems/custom/&lt;id&gt;.md</code> — потом её можно править руками в редакторе. Формат такой же, как у NeetCode 150 в <code>content/problems/neetcode150/</code>.</p>
+      <p class="muted" style="max-width:760px">Задача сохранится в базе и станет видна всем пользователям. Для постоянных задач удобнее файлы: <code>content/problems/…</code> и тесты в <code>content/judge/…</code> (см. CONTENT_FORMAT.md и JUDGE_FORMAT.md).</p>
       <form id="addf" class="card grid" style="max-width:900px">
         <div class="grid g3">
           <label class="field">Название *<input type="text" name="title" required placeholder="Two Sum"></label>
@@ -539,7 +578,10 @@
         <div class="field"><span class="muted small">Алгоритмы</span><div class="row" style="gap:6px">${C.algorithms.map(a => `<label class="tag" style="cursor:pointer"><input type="checkbox" name="algo" value="${a.id}" style="vertical-align:-2px"> ${esc(a.title)}</label>`).join('')}</div></div>
         <label class="field">Условие (markdown)<textarea name="description" rows="6" placeholder="Дан массив nums…"></textarea></label>
         <div id="sols"></div>
-        <div class="row"><button type="button" id="addsol">＋ Ещё решение</button><span class="spacer"></span><button class="primary" type="submit">Сохранить задачу</button></div>
+        <div class="row"><button type="button" id="addsol">＋ Ещё решение</button></div>
+        <label class="field">Заготовка для редактора (Go)<textarea name="starter" rows="5" class="mono" spellcheck="false" placeholder="func twoSum(nums []int, target int) []int {&#10;&#10;}"></textarea></label>
+        <label class="field">Тесты (Go, формат — JUDGE_FORMAT.md; без тестов задачу нельзя решать в редакторе)<textarea name="tests" rows="10" class="mono" spellcheck="false" placeholder="func judgeTests(t *Judge) {&#10;	t.Case(&quot;nums = [2 7 11 15], target = 9&quot;, []int{0, 1}, func() any { return twoSum([]int{2, 7, 11, 15}, 9) }, JAnyOrder)&#10;}"></textarea></label>
+        <div class="row"><span class="spacer"></span><button class="primary" type="submit">Сохранить задачу</button></div>
         <div id="adderr" class="small" style="color:var(--hard)"></div>
       </form>`;
     const f = $('#addf');
@@ -567,11 +609,11 @@
         algorithms: $$('[name=algo]:checked', f).map(x => x.value),
         description: f.description.value,
         solutions: $$('.solbox', f).map(b => ({ title: $('[name=st]', b).value, explanation: $('[name=se]', b).value, code: $('[name=sc]', b).value })),
+        starter: f.starter.value, tests: f.tests.value,
       };
-      const r = await fetch('/api/problems', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      const j = await r.json();
-      if (!r.ok) { $('#adderr').textContent = j.error; return; }
-      toast('Сохранено в ' + j.file);
+      try { await api('/api/problems', { method: 'POST', body }); }
+      catch (err) { $('#adderr').textContent = err.message; return; }
+      toast('Задача сохранена');
       await loadAll();
       location.hash = '#/problem/' + body.id;
     };
@@ -590,14 +632,37 @@
           <div><button class="primary" id="saveset">Сохранить</button></div>
         </div>
         <div class="card grid">
+          <div class="card-title">Аккаунт</div>
+          <div class="small muted">${esc(ME.email)} · с нами с ${SRS.human(SRS.fmt(new Date(ME.createdAt)))}${ME.admin ? ' · администратор' : ''}</div>
+          <label class="field">Имя<input type="text" id="acc-name" maxlength="60" value="${esc(ME.name)}"></label>
+          <div><button id="acc-save-name">Сохранить имя</button></div>
+          <div class="card-title" style="margin-top:6px">Смена пароля</div>
+          <label class="field">Текущий пароль<input type="password" id="acc-old" autocomplete="current-password"></label>
+          <label class="field">Новый пароль (от 8 символов)<input type="password" id="acc-new" autocomplete="new-password" minlength="8"></label>
+          <div class="row"><button id="acc-pass">Сменить пароль</button><span class="spacer"></span><button class="ghost small" id="acc-others">Выйти на других устройствах</button></div>
+          <div><button class="ghost" id="acc-logout">Выйти из аккаунта</button></div>
+        </div>
+        <div class="card grid">
           <div class="card-title">Данные</div>
-          <div class="small muted">Прогресс хранится в <code>data/progress.json</code> (резервные копии раз в день — в <code>data/backup/</code>).</div>
+          <div class="small muted">Прогресс, черновики и история отправок хранятся на сервере в вашем аккаунте и доступны с любого устройства. Экспорт — резервная копия прогресса повторений.</div>
           <div class="row"><button id="exp">Экспорт JSON</button><label class="btn">Импорт JSON<input type="file" id="imp" accept=".json" hidden></label><span class="spacer"></span><button class="danger" id="wipe">Сбросить весь прогресс</button></div>
           <div class="card-title" style="margin-top:10px">Контент</div>
-          <div class="small muted">${C.problems.length} задач, ${C.algorithms.length} статей. Задачи — <code>content/problems/**/*.md</code>, статьи — <code>content/algorithms/*.md</code>. Файлы перечитываются при каждом обновлении страницы.</div>
-          ${(C.errors || []).length ? `<div class="card warn small">${C.errors.map(esc).join('<br>')}</div>` : '<div class="small" style="color:var(--accent)">Ошибок в контенте нет</div>'}
+          <div class="small muted">${C.problems.length} задач (с тестами для редактора — ${C.problems.filter(p => p.hasTests).length}), ${C.algorithms.length} статей.</div>
+          ${ME.admin ? ((C.errors || []).length ? `<div class="card warn small">${C.errors.map(esc).join('<br>')}</div>` : '<div class="small" style="color:var(--accent)">Ошибок в контенте нет</div>') : ''}
         </div>
       </div>`;
+    const updMe = async (body, okMsg) => {
+      try { ME = await api('/api/me', { method: 'PATCH', body }); renderUser(); toast(okMsg); return true; }
+      catch (e) { toast(e.message); return false; }
+    };
+    $('#acc-save-name').onclick = () => updMe({ name: $('#acc-name').value }, 'Имя сохранено');
+    $('#acc-pass').onclick = async () => {
+      if (await updMe({ oldPassword: $('#acc-old').value, newPassword: $('#acc-new').value }, 'Пароль изменён, остальные сессии завершены')) {
+        $('#acc-old').value = $('#acc-new').value = '';
+      }
+    };
+    $('#acc-logout').onclick = () => $('#logout').click();
+    $('#acc-others').onclick = () => updMe({ logoutOther: true }, 'Остальные сессии завершены');
     $('#saveset').onclick = () => {
       const o = $('#offs').value.split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0);
       const okOrder = o.every((x, i) => i === 0 || x > o[i - 1]);
@@ -622,27 +687,374 @@
       } catch (err) { toast('Ошибка импорта: ' + err.message); }
     };
     $('#wipe').onclick = () => {
-      if (!confirm('Удалить весь прогресс? (резервная копия за сегодня останется в data/backup)')) return;
+      if (!confirm('Удалить весь прогресс повторений? Это нельзя отменить (сделайте сначала экспорт). История отправок решений останется.')) return;
       P.problems = {}; save(); toast('Прогресс сброшен');
     };
   }
 
+  // ----- тренажёр кода -----
+  const DRAFTS = {};   // id → текущий код (в памяти)
+  const RESULTS = {};  // id → последний результат проверки
+  const SUBLIST = {};  // id → список отправок (кэш)
+  const solveTab = {};
+  let editor = null, running = false, draftTimer;
+  const lsKey = id => `algotrain:draft:${ME.id}:${id}`;
+  function lsGet(id) { try { return JSON.parse(localStorage.getItem(lsKey(id)) || 'null'); } catch (_) { return null; } }
+  function lsSet(id, code) { try { localStorage.setItem(lsKey(id), JSON.stringify({ code, t: Date.now() })); } catch (_) { } }
+
+  async function loadDraft(p) {
+    if (DRAFTS[p.id] != null) return DRAFTS[p.id];
+    let code = null, t = 0;
+    try {
+      const d = await api('/api/drafts/' + encodeURIComponent(p.id));
+      if (d.code != null) { code = d.code; t = d.updatedAt; }
+    } catch (e) { if (e instanceof AuthError) throw e; }
+    const l = lsGet(p.id); // локальная копия новее серверной — сервер мог не успеть сохранить
+    if (l && l.t > t) code = l.code;
+    if (code == null) code = p.starter || '';
+    return (DRAFTS[p.id] = code);
+  }
+  function saveDraft(id, code, now) {
+    DRAFTS[id] = code;
+    lsSet(id, code);
+    clearTimeout(draftTimer);
+    const go = () => api('/api/drafts/' + encodeURIComponent(id), { method: 'PUT', body: { code } })
+      .then(() => { const s = $('#ed-saved'); if (s) s.textContent = 'черновик сохранён'; })
+      .catch(() => { const s = $('#ed-saved'); if (s) s.textContent = 'черновик сохранён локально'; });
+    if (now) go(); else draftTimer = setTimeout(go, 1500);
+  }
+
+  function linkifyLines(text) {
+    return esc(text).replace(/solution\.go:(\d+)(?::(\d+))?/g, (m, l, c) => `<a href="#" class="jump" data-line="${l}" data-col="${c || 1}">строка ${l}${c ? ':' + c : ''}</a>`);
+  }
+
+  function resultHTML(res, mode, id, history) {
+    const isRun = mode === 'run';
+    const ok = res.status === 'accepted';
+    let h = `<div class="res ${(STATUS_SUB[res.status] || [0, 'warn'])[1]}">
+      <div class="res-head">${subPill(res.status)}
+        <span>${res.status === 'compile_error' ? '' : `${isRun ? 'Примеры' : 'Тесты'}: <b>${res.passed}</b> из ${res.total}`}</span>
+        <span class="spacer"></span>
+        <span class="small muted">${res.status === 'compile_error' ? `компиляция ${res.compileMs} мс` : `выполнение ${res.timeMs} мс · компиляция ${res.compileMs} мс`}</span></div>`;
+    if (ok && isRun) h += `<div class="small" style="margin-top:6px">Примеры пройдены — отправьте решение, чтобы проверить на всех тестах.</div>`;
+    if (res.compile) h += `<pre class="res-pre">${linkifyLines(res.compile)}</pre>`;
+    if (res.error && res.status !== 'compile_error') h += `<pre class="res-pre">${linkifyLines(res.error)}</pre>`;
+    const cases = res.cases || [];
+    if (cases.length && !isRun) {
+      h += `<div class="case-strip">${cases.map(c => `<i class="${c.ok ? 'ok' : 'bad'}" title="Тест ${c.i + 1}${c.ok ? '' : ' — не пройден'}"></i>`).join('')}</div>`;
+    }
+    const shown = isRun ? cases : cases.filter(c => !c.ok).slice(0, 5);
+    h += shown.map(c => `<details class="case" ${!c.ok || isRun ? 'open' : ''}>
+        <summary>${c.ok ? '<span class="ok-t">✓</span>' : '<span class="bad-t">✗</span>'} Тест ${c.i + 1}<span class="spacer"></span><span class="dim small">${c.ms != null && (c.ok || c.got) ? c.ms + ' мс' : ''}</span></summary>
+        ${c.input ? `<div class="kv"><span>Вход</span><code>${esc(c.input)}</code></div>` : ''}
+        ${c.want ? `<div class="kv"><span>Ожидалось</span><code>${esc(c.want)}</code></div>` : ''}
+        ${c.got || (c.ok === false && !c.err) ? `<div class="kv"><span>Получено</span><code class="${c.ok ? '' : 'bad-t'}">${esc(c.got || '')}</code></div>` : ''}
+        ${c.err ? `<div class="kv"><span>Ошибка</span><code class="bad-t">${linkifyLines(c.err)}</code></div>` : ''}
+      </details>`).join('');
+    if (!isRun && cases.filter(c => !c.ok).length > 5) h += `<div class="small muted">…и ещё ${cases.filter(c => !c.ok).length - 5} непройденных тестов</div>`;
+    if (res.stdout) h += `<div class="small muted" style="margin-top:10px">Вывод программы (stdout)</div><pre class="res-pre">${esc(res.stdout)}</pre>`;
+    if (ok && !isRun && id && !history) {
+      const s = st(id);
+      let act = '';
+      if (s === 'new') act = `<button class="primary" data-act="solve" data-id="${id}">✓ Отметить решённой</button><span class="small muted">повторения встанут на ${offs().map(x => '+' + x).join(', ')} день</span>`;
+      else if (s === 'due' || s === 'overdue') act = `<button class="ok" data-act="ok" data-id="${id}">✓ Засчитать повторение</button>`;
+      else act = `<button data-act="practice" data-id="${id}">Записать практику</button><span class="small muted">следующее повторение ${rec(id) && rec(id).due ? SRS.rel(rec(id).due) : 'не запланировано'}</span>`;
+      h += `<div class="srs-box row">Решение принято 🎉 ${act}</div>`;
+    }
+    return h + '</div>';
+  }
+
+  function renderResult(id) {
+    const box = $('#ed-result');
+    if (!box) return;
+    const R = RESULTS[id];
+    if (editor) editor.setErrors({});
+    if (!R) { box.innerHTML = ''; return; }
+    if (R.pending) { box.innerHTML = `<div class="res"><div class="res-head"><span class="spin"></span> ${R.mode === 'run' ? 'Запускаю на примерах…' : 'Проверяю на всех тестах…'}</div></div>`; return; }
+    if (R.error) { box.innerHTML = `<div class="res bad"><div class="res-head">Не удалось проверить</div><div class="small">${esc(R.error)}</div></div>`; return; }
+    box.innerHTML = resultHTML(R.result, R.mode, R.srsDone ? null : id);
+    if (R.result.compile && editor) {
+      const errs = {};
+      for (const m of R.result.compile.matchAll(/solution\.go:(\d+)(?::\d+)?: (.*)/g)) errs[+m[1]] = (errs[+m[1]] ? errs[+m[1]] + '\n' : '') + m[2];
+      editor.setErrors(errs);
+    }
+  }
+
+  async function runCode(id, mode) {
+    if (running || !editor) return;
+    const code = editor.value;
+    if (!code.trim()) { toast('Пустой код'); return; }
+    saveDraft(id, code);
+    running = true;
+    RESULTS[id] = { mode, pending: true };
+    $$('#ed-run, #ed-submit').forEach(b => b.disabled = true);
+    renderResult(id);
+    try {
+      const j = await api('/api/run/' + encodeURIComponent(id), { method: 'POST', body: { code, mode } });
+      RESULTS[id] = { mode, result: j.result };
+      if (j.submission) {
+        const s = SUBS[id] || { count: 0, accepted: false };
+        s.count++; s.accepted = s.accepted || j.submission.status === 'accepted'; s.last = j.submission.createdAt;
+        SUBS[id] = s;
+        if (SUBLIST[id]) SUBLIST[id].unshift(j.submission);
+      }
+    } catch (e) {
+      RESULTS[id] = { mode, error: e.message };
+    }
+    running = false;
+    if (route._last === 'solve/' + id) {
+      $$('#ed-run, #ed-submit').forEach(b => b.disabled = false);
+      renderResult(id);
+      const badge = $('#solve-badge'); if (badge) badge.innerHTML = codeBadge(id);
+      if ((solveTab[id] || 'desc') === 'subs') renderSolveTab(id);
+      const r = $('#ed-result'); if (r) r.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
+
+  async function renderSolveTab(id) {
+    const p = byId[id], tab = solveTab[id] || 'desc';
+    const body = $('#stab-body');
+    if (!body) return;
+    $$('[data-stab]').forEach(b => b.classList.toggle('active', b.dataset.stab === tab));
+    if (tab === 'desc') {
+      body.innerHTML = `<div class="prose">${MD.render(p.description)}</div>
+        <div class="small muted" style="margin-top:14px"><a href="#/problem/${id}">Страница задачи</a> — график повторений, заметки, алгоритмы.</div>`;
+    } else if (tab === 'sols') {
+      const hide = P.settings.hideSolutions !== false && !shownSolutions.has(id);
+      body.innerHTML = hide
+        ? `<div class="spoiler">Эталонные решения скрыты, чтобы сначала решить самому.<div style="margin-top:12px"><button id="show-sol2">Показать ${p.solutions.length}</button></div></div>`
+        : `<div class="tabs">${p.solutions.map((x, i) => `<button data-tab="${i}" class="${i === 0 ? 'active' : ''}">${esc(x.title)}</button>`).join('')}</div>
+           ${p.solutions.map((x, i) => `<div class="sol prose" data-pane="${i}" ${i ? 'hidden' : ''}>${MD.render(x.explanation)}${MD.codeBlock(x.code, x.lang)}</div>`).join('')}`;
+      const sb = $('#show-sol2'); if (sb) sb.onclick = () => { shownSolutions.add(id); renderSolveTab(id); };
+      $$('[data-tab]', body).forEach(b => b.onclick = () => {
+        $$('[data-tab]', body).forEach(x => x.classList.toggle('active', x === b));
+        $$('[data-pane]', body).forEach(x => x.hidden = x.dataset.pane !== b.dataset.tab);
+      });
+    } else {
+      if (!SUBLIST[id]) {
+        body.innerHTML = '<div class="muted">Загрузка…</div>';
+        try { SUBLIST[id] = await api('/api/submissions?limit=100&problem=' + encodeURIComponent(id)); }
+        catch (e) { body.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+        if ((solveTab[id] || 'desc') !== 'subs' || !$('#stab-body')) return;
+      }
+      const list = SUBLIST[id];
+      body.innerHTML = list.length ? `<div class="small muted" style="margin-bottom:8px">Отправок: ${list.length}${list.some(s => s.status === 'accepted') ? ' · есть принятое решение' : ''}. Нажмите на отправку, чтобы посмотреть код.</div>
+        <div class="sub-list">${list.map(s => `<div class="sub-row" data-sid="${s.id}">${subPill(s.status)}<span>${s.passed}/${s.total}</span><span class="dim small">${s.status === 'compile_error' ? '' : s.timeMs + ' мс'}</span><span class="spacer"></span><span class="muted small">${ago(s.createdAt)}</span></div><div class="sub-detail" id="sd-${s.id}" hidden></div>`).join('')}</div>`
+        : '<div class="empty">Отправок пока нет. Напишите решение и нажмите «Отправить» — оно проверится на всех тестах и попадёт сюда.</div>';
+      $$('[data-sid]', body).forEach(row => row.onclick = async () => {
+        const d = $('#sd-' + row.dataset.sid);
+        if (!d.hidden) { d.hidden = true; return; }
+        d.hidden = false;
+        d.innerHTML = '<div class="muted small">Загрузка…</div>';
+        try {
+          const j = await api('/api/submissions/' + row.dataset.sid);
+          d.innerHTML = `<div class="row" style="margin:6px 0"><button class="small" data-load>⤓ Загрузить в редактор</button><a class="small" href="#/submission/${j.submission.id}">Открыть отдельно</a></div>
+            ${MD.codeBlock(j.submission.code, 'go')}${resultHTML(j.result, 'submit', id, true)}`;
+          $('[data-load]', d).onclick = () => {
+            if (editor && editor.value !== j.submission.code && !confirm('Заменить код в редакторе кодом этой отправки?')) return;
+            editor.value = j.submission.code; saveDraft(id, j.submission.code); toast('Код загружен в редактор');
+          };
+        } catch (e) { d.innerHTML = `<div class="small" style="color:var(--hard)">${esc(e.message)}</div>`; }
+      });
+    }
+  }
+
+  async function viewSolve(id) {
+    const p = byId[id];
+    if (!p) { app.innerHTML = `<div class="empty">Задача «${esc(id)}» не найдена</div>`; return; }
+    if (!p.hasTests) { app.innerHTML = `<div class="empty">Для задачи «${esc(p.title)}» пока нет тестов. <a href="#/problem/${id}">К задаче</a></div>`; return; }
+    const withTests = C.problems.filter(q => q.hasTests);
+    const idx = withTests.indexOf(p);
+    const prev = withTests[idx - 1], next = withTests[idx + 1];
+    app.innerHTML = `
+      <div class="row solve-head">
+        <a href="#/problem/${id}" class="small">← Задача</a>
+        <h2 style="margin:0">${p.leetcode ? `<span class="dim">${p.leetcode}.</span> ` : ''}${esc(p.title)}</h2>
+        ${diff(p.difficulty)} ${pill(st(id))} <span id="solve-badge">${codeBadge(id)}</span>
+        <span class="spacer"></span>
+        ${prev ? `<a class="small" href="#/solve/${prev.id}" title="${esc(prev.title)}">‹ пред.</a>` : ''}
+        ${next ? `<a class="small" href="#/solve/${next.id}" title="${esc(next.title)}">след. ›</a>` : ''}
+      </div>
+      <div class="solve">
+        <section class="card solve-left">
+          <div class="tabs"><button data-stab="desc">Условие</button><button data-stab="subs">Мои отправки</button><button data-stab="sols">Решения</button></div>
+          <div id="stab-body"></div>
+        </section>
+        <section class="solve-right">
+          <div class="ed-toolbar row">
+            <span class="small muted">Go</span><span id="ed-saved" class="small dim"></span>
+            <span class="spacer"></span>
+            <button class="ghost small" id="ed-reset" title="Вернуть исходную заготовку">↺ Заготовка</button>
+            <button id="ed-run" title="Ctrl+'">▶ Запустить</button>
+            <button class="primary" id="ed-submit" title="Ctrl+Enter">Отправить</button>
+          </div>
+          <div id="ed-host"><div class="ed ed-loading">Загрузка…</div></div>
+          <div class="small dim ed-hint">Ctrl+' — запустить на примерах · Ctrl+Enter — отправить на все тесты · Ctrl+/ — комментарий · Tab / Shift+Tab — отступ. <code>package</code> и импорты стандартной библиотеки добавляются сами.</div>
+          <div id="ed-result"></div>
+        </section>
+      </div>`;
+    $$('[data-stab]').forEach(b => b.onclick = () => { solveTab[id] = b.dataset.stab; renderSolveTab(id); });
+    renderSolveTab(id);
+    const here = route._last;
+    let code;
+    try { code = await loadDraft(p); } catch (e) { return; }
+    if (route._last !== here) return;
+    editor = Editor.create($('#ed-host'), {
+      value: code,
+      onChange: v => { saveDraft(id, v); $('#ed-saved').textContent = ''; },
+      onRun: () => runCode(id, 'run'),
+      onSubmit: () => runCode(id, 'submit'),
+      onSave: () => saveDraft(id, editor.value, true),
+    });
+    $('#ed-run').onclick = () => runCode(id, 'run');
+    $('#ed-submit').onclick = () => runCode(id, 'submit');
+    $('#ed-reset').onclick = () => {
+      if (editor.value !== p.starter && !confirm('Заменить код исходной заготовкой? Текущий код останется в истории, только если вы его отправляли.')) return;
+      editor.value = p.starter || ''; saveDraft(id, editor.value);
+    };
+    if (running) $$('#ed-run, #ed-submit').forEach(b => b.disabled = true);
+    renderResult(id);
+    $('#ed-result').addEventListener('click', e => {
+      const j = e.target.closest('[data-line]');
+      if (j) { e.preventDefault(); editor.gotoLine(+j.dataset.line, +j.dataset.col || 1); }
+    });
+    if (!('ontouchstart' in window)) editor.focus();
+  }
+
+  // ----- все отправки -----
+  async function viewSubmissions() {
+    app.innerHTML = '<h1>Мои отправки</h1><div class="muted">Загрузка…</div>';
+    const here = route._last;
+    let list;
+    try { list = await api('/api/submissions?limit=200'); } catch (e) { app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+    if (route._last !== here) return;
+    const acc = new Set(list.filter(s => s.status === 'accepted').map(s => s.problemId));
+    app.innerHTML = `<div class="row" style="margin-bottom:16px"><h1 style="margin:0">Мои отправки</h1><span class="muted">последние ${list.length} · принято задач: ${Object.values(SUBS).filter(s => s.accepted).length}</span></div>
+      ${list.length ? `<div class="card" style="overflow-x:auto"><table class="plist"><thead><tr><th>Когда</th><th>Задача</th><th>Статус</th><th>Тесты</th><th>Время</th><th></th></tr></thead><tbody>
+      ${list.map(s => {
+      const p = byId[s.problemId];
+      return `<tr><td class="small muted" style="white-space:nowrap">${ago(s.createdAt)}</td>
+          <td class="ttl"><a href="#/submission/${s.id}">${esc(p ? p.title : s.problemId)}</a> ${acc.has(s.problemId) && s.status !== 'accepted' ? '' : ''}</td>
+          <td>${subPill(s.status)}</td><td>${s.passed}/${s.total}</td><td class="small muted">${s.status === 'compile_error' ? '—' : s.timeMs + ' мс'}</td>
+          <td style="white-space:nowrap"><a class="small" href="#/solve/${s.problemId}">⌨ решать</a></td></tr>`;
+    }).join('')}</tbody></table></div>`
+        : '<div class="empty">Пока нет ни одной отправки. Откройте любую задачу и нажмите «Решать в редакторе».</div>'}`;
+  }
+
+  async function viewSubmission(sid) {
+    app.innerHTML = '<div class="muted">Загрузка…</div>';
+    const here = route._last;
+    let j;
+    try { j = await api('/api/submissions/' + encodeURIComponent(sid)); } catch (e) { app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+    if (route._last !== here) return;
+    const s = j.submission, p = byId[s.problemId];
+    app.innerHTML = `<div class="row small muted" style="margin-bottom:10px"><a href="#/submissions">← Все отправки</a></div>
+      <div class="row" style="margin-bottom:14px"><h1 style="margin:0">${esc(p ? p.title : s.problemId)}</h1>${subPill(s.status)}<span class="muted">${ago(s.createdAt)}</span><span class="spacer"></span>
+        <button id="to-editor">⤓ Открыть в редакторе</button></div>
+      <div class="layout-2">
+        <div class="card">${MD.codeBlock(s.code, 'go')}</div>
+        <div>${resultHTML(j.result, 'submit', s.problemId, true)}</div>
+      </div>`;
+    $('#to-editor').onclick = () => {
+      if (DRAFTS[s.problemId] != null && DRAFTS[s.problemId] !== s.code && !confirm('Заменить текущий черновик в редакторе кодом этой отправки?')) return;
+      saveDraft(s.problemId, s.code, true);
+      location.hash = '#/solve/' + s.problemId;
+    };
+  }
+
+  // ----- вход и регистрация -----
+  function showAuth(mode) {
+    mode = mode || 'login';
+    document.body.classList.add('guest');
+    const reg = mode === 'register';
+    app.innerHTML = `<div class="auth">
+      <div class="auth-intro">
+        <div class="brand big"><span class="logo"><svg viewBox="0 0 32 32"><path d="M7 22l5-12 4 8 3-5 4 9" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span>AlgoTrain</span></div>
+        <h1>Подготовка к алгоритмическим собеседованиям на Go</h1>
+        <ul class="auth-feat">
+          <li><b>NeetCode 150</b> — условия, подсказки и несколько эталонных решений на Go</li>
+          <li><b>Редактор кода</b> — решайте прямо в браузере, решения проверяются на тестах</li>
+          <li><b>История отправок</b> — все попытки по каждой задаче с кодом и результатами</li>
+          <li><b>Интервальные повторения</b> — +1, +3, +6, +11 дней, календарь и прогноз нагрузки</li>
+          <li><b>Статьи об алгоритмах</b> — история, анимации, применение в бигтехе, финтехе и геймдеве</li>
+        </ul>
+      </div>
+      <form class="card auth-card grid" id="authf" novalidate>
+        <div class="tabs"><button type="button" data-am="login" class="${reg ? '' : 'active'}">Вход</button><button type="button" data-am="register" class="${reg ? 'active' : ''}">Регистрация</button></div>
+        <label class="field">Email<input type="email" name="email" autocomplete="email" required></label>
+        ${reg ? '<label class="field">Имя<input type="text" name="name" autocomplete="nickname" maxlength="60" placeholder="как к вам обращаться"></label>' : ''}
+        <label class="field">Пароль<input type="password" name="password" autocomplete="${reg ? 'new-password' : 'current-password'}" required minlength="${reg ? 8 : 1}"></label>
+        ${reg ? '<div class="small muted">Не короче 8 символов.</div>' : ''}
+        <button class="primary" type="submit">${reg ? 'Создать аккаунт' : 'Войти'}</button>
+        <div id="autherr" class="small" style="color:var(--hard);min-height:1em"></div>
+      </form>
+    </div>`;
+    $$('[data-am]').forEach(b => b.onclick = () => showAuth(b.dataset.am));
+    const f = $('#authf');
+    f.email.focus();
+    f.onsubmit = async e => {
+      e.preventDefault();
+      const btn = $('button[type=submit]', f);
+      btn.disabled = true;
+      try {
+        const body = { email: f.email.value, password: f.password.value };
+        if (reg) body.name = f.name.value;
+        ME = await api('/api/auth/' + (reg ? 'register' : 'login'), { method: 'POST', body, allow401: true });
+        await start();
+      } catch (err) {
+        $('#autherr').textContent = err.message;
+        btn.disabled = false;
+      }
+    };
+  }
+
+  function renderUser() {
+    const box = $('#user-box');
+    if (!ME) { box.innerHTML = ''; return; }
+    box.innerHTML = `<a href="#/settings" class="user-name" title="${esc(ME.email)}">${esc(ME.name || ME.email)}</a><button class="ghost small" id="logout" title="Выйти">Выйти</button>`;
+    $('#logout').onclick = async () => {
+      await flushSave(false);
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) { }
+      ME = null; P = {}; SUBS = {};
+      for (const o of [DRAFTS, RESULTS, SUBLIST]) for (const k in o) delete o[k];
+      renderUser();
+      showAuth();
+    };
+    $('#nav-add').hidden = !ME.admin;
+  }
+
+  async function start() {
+    document.body.classList.remove('guest');
+    renderUser();
+    app.innerHTML = '<div class="loading">Загрузка…</div>';
+    await loadAll();
+    route._last = null;
+    route();
+  }
+
   // ---------- router ----------
   function route() {
+    if (!ME) { showAuth(); return; }
     const h = location.hash.replace(/^#\/?/, '');
     const [view, a, b] = h.split('/');
-    $$('#nav a').forEach(l => l.classList.toggle('active', l.dataset.route === ({ '': 'today', problem: 'problems', algo: 'algorithms' }[view] || view)));
+    const navMap = { '': 'today', problem: 'problems', solve: 'problems', algo: 'algorithms', submission: 'submissions' };
+    $$('#nav a').forEach(l => l.classList.toggle('active', l.dataset.route === (navMap[view] || view)));
     const keepScroll = route._last === h;
     route._last = h;
     const y = window.scrollY;
+    document.body.classList.toggle('wide', view === 'solve');
+    if (view !== 'solve') editor = null;
     switch (view) {
       case '': viewToday(); break;
       case 'problems': viewProblems(); break;
       case 'problem': viewProblem(decodeURIComponent(a)); break;
+      case 'solve': viewSolve(decodeURIComponent(a)); break;
+      case 'submissions': viewSubmissions(); break;
+      case 'submission': viewSubmission(a); break;
       case 'calendar': viewCalendar(a, b); break;
       case 'algorithms': viewAlgorithms(); break;
       case 'algo': viewAlgo(a); break;
-      case 'add': viewAdd(); break;
+      case 'add': if (ME.admin) viewAdd(); else app.innerHTML = '<div class="empty">Добавлять задачи может только администратор</div>'; break;
       case 'settings': viewSettings(); break;
       default: app.innerHTML = '<div class="empty">Страница не найдена</div>';
     }
@@ -650,11 +1062,24 @@
     updateChrome();
   }
   window.addEventListener('hashchange', route);
-  $('#theme-toggle').onclick = () => { P.settings.theme = (P.settings.theme || 'dark') === 'dark' ? 'light' : 'dark'; save(); };
+  $('#theme-toggle').onclick = () => {
+    const t = (document.documentElement.dataset.theme || 'dark') === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem('algotrain:theme', t); } catch (_) { }
+    document.documentElement.dataset.theme = t;
+    if (ME) { P.settings.theme = t; save(); }
+  };
+  try { const t = localStorage.getItem('algotrain:theme'); if (t) document.documentElement.dataset.theme = t; } catch (_) { }
 
   // смена дня, если вкладка открыта через полночь
   let day = SRS.today();
-  setInterval(() => { if (SRS.today() !== day) { day = SRS.today(); route(); } }, 60000);
+  setInterval(() => { if (SRS.today() !== day && ME) { day = SRS.today(); route(); } }, 60000);
 
-  loadAll().then(route).catch(e => { app.innerHTML = `<div class="empty">Не удалось загрузить данные: ${esc(e.message)}<br>Запусти сервер: <code>go run .</code></div>`; });
+  (async () => {
+    try { ME = await api('/api/me', { allow401: true }); } catch (e) {
+      ME = null;
+      if (!/войти/.test(e.message)) { app.innerHTML = `<div class="empty">Не удалось связаться с сервером: ${esc(e.message)}</div>`; return; }
+    }
+    if (!ME) { showAuth(); return; }
+    try { await start(); } catch (e) { if (!(e instanceof AuthError)) app.innerHTML = `<div class="empty">Не удалось загрузить данные: ${esc(e.message)}</div>`; }
+  })();
 })();

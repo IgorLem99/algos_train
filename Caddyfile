@@ -1,0 +1,20 @@
+# Caddy сам получает и продлевает сертификат Let's Encrypt для {$DOMAIN}.
+{$DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	# несколько экземпляров app — балансировка и проверка живости
+	reverse_proxy app:8080 {
+		lb_policy least_conn
+		health_uri /healthz
+		health_interval 10s
+		transport http {
+			response_header_timeout 120s
+		}
+	}
+	request_body {
+		max_size 2MB
+	}
+}
